@@ -1,0 +1,149 @@
+// shelly script to be install within your 2 or 3 or 4 PM
+// All values are customizable function of when and what you want to put on function of the remaining electricity stock
+
+let CERBO_IP = "10.46.46.108"; // Cerbo GX REST API IP
+let RELAY_ID = 0; // Relay ID for heating
+let MIN_SOC = 85; // Minimum SoC to activate warm-up
+let STOP_SOC = 70; // Stop warm-up if SoC falls below this
+let MIN_SOLAR_POWER = 1000; // Minimum solar power (W) to start warm-up
+let START_TIME = 10; // 10:00 AM
+let END_TIME = 17; // 5:00 PM
+let MAX_DAILY_RUNTIME = 120; // Max heating time per day (minutes)
+let FALLBACK_HOUR = 20; // 8:00 PM fallback hour
+let FALLBACK_DURATION = 60; // 1-hour fallback heating
+let FORCED_MODE_MAX = 120; // Max forced mode time in minutes
+let BUFFER_TIME = 10; // Prevent flickering by adding a buffer
+let check_interval = 600; // 10 minutes
+
+let last_on_time = 0;
+let daily_runtime = 0;
+let last_heating_day = -1;
+let forced_mode_start = null;
+let warmup_active = false;
+
+// Function to fetch SoC and Solar Power from REST API
+function fetchSystemStatus(callback) {
+    let soc_url = "http://" + CERBO_IP + ":8080/soc";
+    let solar_url = "http://" + CERBO_IP + ":8080/solar";
+    
+    Shelly.call("HTTP.GET", { url: soc_url }, function (soc_res) {
+        if (!soc_res || !soc_res.body) {
+            print("[ERROR] Failed to get SoC!");
+            callback(null, null);
+            return;
+        }
+        
+        let soc = JSON.parse(soc_res.body).soc;
+        
+        Shelly.call("HTTP.GET", { url: solar_url }, function (solar_res) {
+            if (!solar_res || !solar_res.body) {
+                print("[ERROR] Failed to get Solar Power!");
+                callback(null, null);
+                return;
+            }
+
+            let solar_power = JSON.parse(solar_res.body).solar_power;
+            print("[INFO] Battery SoC:", soc, "% | Solar Power:", solar_power, "W");
+            callback(soc, solar_power);
+        });
+    });
+}
+
+// Function to manage warm-up phase
+function manageWarmup(soc, solar_power) {
+    if (warmup_active) {
+        // If conditions fail, stop warm-up
+        if (soc < STOP_SOC || solar_power < MIN_SOLAR_POWER) {
+            print("[WARM-UP] Conditions not met. Stopping warm-up.");
+            Shelly.call("Switch.Set", { id: RELAY_ID, on: false });
+            warmup_active = false;
+        } else {
+            print("[WARM-UP] Active... SoC:", soc, "% | Solar:", solar_power, "W");
+        }
+    } else {
+        // Start warm-up if conditions are met
+        if (soc >= MIN_SOC && solar_power >= MIN_SOLAR_POWER) {
+            print("[WARM-UP] Starting warm-up phase.");
+            Shelly.call("Switch.Set", { id: RELAY_ID, on: true });
+            warmup_active = true;
+        } else {
+            print("[WARM-UP] Not enough solar power or SoC too low.");
+        }
+    }
+}
+
+// Function to manage relay logic after warm-up
+function manageRelay(soc, solar_power) {
+    let now = new Date();
+    let current_hour = now.getHours();
+    let current_day = now.getDate();
+
+    // Reset daily runtime if a new day
+    if (current_day !== last_heating_day) {
+        daily_runtime = 0;
+        last_heating_day = current_day;
+    }
+
+    // Check if relay is already on (forced mode detection)
+    Shelly.call("Switch.GetStatus", { id: RELAY_ID }, function (res) {
+        let relay_state = res.output;
+        
+        // Detect forced mode
+        if (relay_state && forced_mode_start === null) {
+            print("[WARNING] Relay was ON at startup! Assuming forced mode.");
+            forced_mode_start = now.getTime();
+        }
+
+        // Forced mode control (max 2h)
+        if (forced_mode_start !== null) {
+            let elapsed_forced_time = (now.getTime() - forced_mode_start) / (1000 * 60);
+            if (elapsed_forced_time >= FORCED_MODE_MAX) {
+                print("[FORCED MODE] Max 2h reached. Turning OFF relay.");
+                Shelly.call("Switch.Set", { id: RELAY_ID, on: false });
+                forced_mode_start = null;
+                return;
+            }
+        }
+
+        // Automatic heating logic after warm-up
+        if (!warmup_active && soc !== null && soc >= MIN_SOC && current_hour >= START_TIME && current_hour < END_TIME) {
+            if (!relay_state && daily_runtime < MAX_DAILY_RUNTIME) {
+                print("[HEATING] Battery SoC OK & Time OK. Turning ON relay.");
+                Shelly.call("Switch.Set", { id: RELAY_ID, on: true });
+                last_on_time = now.getTime();
+                daily_runtime += BUFFER_TIME;
+            }
+        } else {
+            if (relay_state) {
+                print("[INFO] Conditions not met. Turning OFF relay.");
+                Shelly.call("Switch.Set", { id: RELAY_ID, on: false });
+            }
+        }
+
+        // Fallback mode (8:00 PM heating if no heating happened)
+        if (current_hour === FALLBACK_HOUR && daily_runtime === 0) {
+            print("[FALLBACK] No heating today. Running fallback heating for 1 hour.");
+            Shelly.call("Switch.Set", { id: RELAY_ID, on: true });
+            last_on_time = now.getTime();
+            daily_runtime += FALLBACK_DURATION;
+        }
+    });
+}
+
+// Scheduled function to run every 10 minutes
+function scheduledCheck() {
+    print("[TIMER] Running scheduled check...");
+    fetchSystemStatus(function (soc, solar_power) {
+        if (soc !== null && solar_power !== null) {
+            manageWarmup(soc, solar_power);
+            if (!warmup_active) {
+                manageRelay(soc, solar_power);
+            }
+        }
+    });
+}
+
+// Start script
+print("[START] Shelly script started: Monitoring Cerbo GX REST API.");
+scheduledCheck();
+Timer.set(check_interval * 1000, true, scheduledCheck);
